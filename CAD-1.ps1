@@ -1,35 +1,48 @@
 <#
 .SYNOPSIS
-    Discover all Azure VMs in Azure Government and report previous month's
-    average and peak CPU utilization.
+    Discover Azure Government VMs and export a CSV with performance metrics,
+    tags, update status, and a resource link.
 
 .DESCRIPTION
-    - Connects to Azure Government
-    - Enumerates all accessible subscriptions
-    - Enumerates all VMs in each subscription
-    - Pulls Azure Monitor "Percentage CPU" for the previous calendar month
-    - Outputs results to screen and CSV
+    Output CSV columns:
+      Server Name
+      Subscription Name
+      Resource Group Name
+      Tags
+      Percentage CPU (Avg)
+      Percentage CPU (Max)
+      Available Memory Percentage (Avg)
+      Available Memory Percentage (Min)
+      OS Disk IOPS Consumed Percentage (Avg)
+      Network In Total (Sum)
+      Network Out Total (Sum)
+      Update Status
+      Resource Link
 
 .NOTES
     Required modules:
       Az.Accounts
       Az.Compute
       Az.Monitor
+      Az.ResourceGraph
+
+    Notes:
+      - Available Memory Percentage may be blank unless guest metrics are available.
+      - OS Disk IOPS Consumed Percentage may be blank on VMs/SKUs that do not expose it.
+      - Update Status is derived from the latest Azure Update Manager assessment record
+        found in Azure Resource Graph for the VM.
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$OutputCsv = ".\AzureGov-PreviousMonth-CPUReport.csv",
+    [string]$OutputCsv = ".\AzureGov-VM-MonthlyMetrics.csv",
 
     [Parameter(Mandatory = $false)]
     [switch]$UseDeviceAuthentication,
 
     [Parameter(Mandatory = $false)]
-    [string[]]$SubscriptionId,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$IncludeStoppedVMs
+    [string[]]$SubscriptionId
 )
 
 Set-StrictMode -Version Latest
@@ -61,89 +74,203 @@ function Get-PreviousMonthWindowUtc {
     }
 }
 
-function Get-VmPowerState {
+function Convert-TagsToString {
     param(
-        [Parameter(Mandatory = $true)]
-        [object]$Vm
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Tags
     )
 
-    $statusesProperty = $Vm.PSObject.Properties["Statuses"]
-
-    if ($statusesProperty -and $statusesProperty.Value) {
-        $power = $statusesProperty.Value |
-            Where-Object { $_.Code -like "PowerState/*" } |
-            Select-Object -ExpandProperty DisplayStatus -First 1
-
-        if ($power) {
-            return $power
-        }
+    if (-not $Tags -or $Tags.Count -eq 0) {
+        return ""
     }
 
-    return "Unknown"
+    $pairs = foreach ($key in ($Tags.Keys | Sort-Object)) {
+        $value = $Tags[$key]
+        "{0}={1}" -f $key, $value
+    }
+
+    return ($pairs -join "; ")
 }
 
-function Get-OverallCpuStats {
+function Get-AzureGovResourceLink {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceId
+    )
+
+    return "https://portal.azure.us/#resource$ResourceId/overview"
+}
+
+function Get-MetricAggregateValue {
     param(
         [Parameter(Mandatory = $true)]
         [string]$ResourceId,
 
         [Parameter(Mandatory = $true)]
+        [string]$MetricName,
+
+        [Parameter(Mandatory = $true)]
         [datetime]$StartTimeUtc,
 
         [Parameter(Mandatory = $true)]
-        [datetime]$EndTimeUtc
+        [datetime]$EndTimeUtc,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Average","Minimum","Maximum","Total","Count")]
+        [string]$AggregationType,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Average","Minimum","Maximum","Sum")]
+        [string]$Rollup
     )
 
-    $metric = Get-AzMetric `
-        -ResourceId $ResourceId `
-        -MetricName "Percentage CPU" `
-        -StartTime $StartTimeUtc `
-        -EndTime $EndTimeUtc `
-        -TimeGrain 01:00:00 `
-        -DetailedOutput `
-        -ErrorAction Stop
+    try {
+        $metric = Get-AzMetric `
+            -ResourceId $ResourceId `
+            -MetricName $MetricName `
+            -StartTime $StartTimeUtc `
+            -EndTime $EndTimeUtc `
+            -TimeGrain 01:00:00 `
+            -AggregationType $AggregationType `
+            -ErrorAction Stop
 
-    if (-not $metric -or -not $metric.Data) {
-        return [PSCustomObject]@{
-            AverageCpu = $null
-            PeakCpu    = $null
-            Samples    = 0
+        if (-not $metric -or -not $metric.Data) {
+            return $null
+        }
+
+        switch ($AggregationType) {
+            "Average" { $values = @($metric.Data | Where-Object { $null -ne $_.Average } | Select-Object -ExpandProperty Average) }
+            "Minimum" { $values = @($metric.Data | Where-Object { $null -ne $_.Minimum } | Select-Object -ExpandProperty Minimum) }
+            "Maximum" { $values = @($metric.Data | Where-Object { $null -ne $_.Maximum } | Select-Object -ExpandProperty Maximum) }
+            "Total"   { $values = @($metric.Data | Where-Object { $null -ne $_.Total }   | Select-Object -ExpandProperty Total) }
+            "Count"   { $values = @($metric.Data | Where-Object { $null -ne $_.Count }   | Select-Object -ExpandProperty Count) }
+            default   { $values = @() }
+        }
+
+        if ($values.Count -eq 0) {
+            return $null
+        }
+
+        switch ($Rollup) {
+            "Average" { return [math]::Round((($values | Measure-Object -Average).Average), 2) }
+            "Minimum" { return [math]::Round((($values | Measure-Object -Minimum).Minimum), 2) }
+            "Maximum" { return [math]::Round((($values | Measure-Object -Maximum).Maximum), 2) }
+            "Sum"     { return [math]::Round((($values | Measure-Object -Sum).Sum), 2) }
         }
     }
+    catch {
+        return $null
+    }
+}
 
-    $avgValues = @(
-        $metric.Data |
-        Where-Object { $null -ne $_.Average } |
-        Select-Object -ExpandProperty Average
+function Invoke-AzGraphQueryAll {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Query,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$SubscriptionIds
     )
 
-    $maxValues = @(
-        $metric.Data |
-        Where-Object { $null -ne $_.Maximum } |
-        Select-Object -ExpandProperty Maximum
+    $allRows = New-Object System.Collections.Generic.List[object]
+    $skipToken = $null
+
+    do {
+        $params = @{
+            Query = $Query
+            First = 1000
+        }
+
+        if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
+            $params["Subscription"] = $SubscriptionIds
+        }
+
+        if ($skipToken) {
+            $params["SkipToken"] = $skipToken
+        }
+
+        $response = Search-AzGraph @params
+
+        if ($response.Data) {
+            foreach ($row in $response.Data) {
+                $allRows.Add($row)
+            }
+        }
+
+        $skipToken = $response.SkipToken
+    }
+    while ($skipToken)
+
+    return $allRows
+}
+
+function Get-UpdateStatusMap {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string[]]$SubscriptionIds
     )
 
-    $overallAverage = $null
-    if ($avgValues.Count -gt 0) {
-        $overallAverage = [math]::Round((($avgValues | Measure-Object -Average).Average), 2)
+    $query = @"
+patchassessmentresources
+| where type !has "softwarepatches"
+| extend vmResourceId = tostring(split(id, '/patchAssessmentResults/', 0))
+| extend prop = parse_json(properties)
+| extend lastModified = todatetime(prop.lastModifiedDateTime)
+| extend rebootPending = tostring(prop.rebootPending)
+| extend availablePatchCountByClassification = prop.availablePatchCountByClassification
+| extend availablePatchCount =
+    toint(coalesce(availablePatchCountByClassification.critical, 0)) +
+    toint(coalesce(availablePatchCountByClassification.security, 0)) +
+    toint(coalesce(availablePatchCountByClassification.updateRollup, 0)) +
+    toint(coalesce(availablePatchCountByClassification.featurePack, 0)) +
+    toint(coalesce(availablePatchCountByClassification.servicePack, 0)) +
+    toint(coalesce(availablePatchCountByClassification.definition, 0)) +
+    toint(coalesce(availablePatchCountByClassification.updates, 0)) +
+    toint(coalesce(availablePatchCountByClassification.tools, 0)) +
+    toint(coalesce(availablePatchCountByClassification.other, 0))
+| summarize arg_max(lastModified, *) by vmResourceId
+| project vmResourceId, lastModified, rebootPending, availablePatchCount
+"@
+
+    $rows = Invoke-AzGraphQueryAll -Query $query -SubscriptionIds $SubscriptionIds
+    $map = @{}
+
+    foreach ($row in $rows) {
+        $status = "No assessment data"
+
+        $availablePatchCount = 0
+        if ($null -ne $row.availablePatchCount -and "$($row.availablePatchCount)" -ne "") {
+            $availablePatchCount = [int]$row.availablePatchCount
+        }
+
+        $rebootPending = "$($row.rebootPending)"
+
+        if ($rebootPending -eq "true" -or $rebootPending -eq "True") {
+            if ($availablePatchCount -gt 0) {
+                $status = "Updates available ($availablePatchCount); Reboot pending"
+            }
+            else {
+                $status = "Reboot pending"
+            }
+        }
+        elseif ($availablePatchCount -gt 0) {
+            $status = "Updates available ($availablePatchCount)"
+        }
+        else {
+            $status = "Up to date"
+        }
+
+        $map[$row.vmResourceId.ToLowerInvariant()] = $status
     }
 
-    $overallPeak = $null
-    if ($maxValues.Count -gt 0) {
-        $overallPeak = [math]::Round((($maxValues | Measure-Object -Maximum).Maximum), 2)
-    }
-
-    [PSCustomObject]@{
-        AverageCpu = $overallAverage
-        PeakCpu    = $overallPeak
-        Samples    = [math]::Max($avgValues.Count, $maxValues.Count)
-    }
+    return $map
 }
 
 try {
     Test-RequiredModule -Name "Az.Accounts"
     Test-RequiredModule -Name "Az.Compute"
     Test-RequiredModule -Name "Az.Monitor"
+    Test-RequiredModule -Name "Az.ResourceGraph"
 
     Write-Host "Connecting to Azure Government..." -ForegroundColor Cyan
     if ($UseDeviceAuthentication) {
@@ -170,6 +297,10 @@ try {
         throw "No accessible subscriptions were found."
     }
 
+    $subscriptionIds = @($subscriptions | Select-Object -ExpandProperty Id)
+    Write-Host "Loading update assessment status from Azure Resource Graph..." -ForegroundColor Cyan
+    $updateStatusMap = Get-UpdateStatusMap -SubscriptionIds $subscriptionIds
+
     $results = New-Object System.Collections.Generic.List[object]
 
     foreach ($sub in $subscriptions) {
@@ -188,86 +319,97 @@ try {
         foreach ($vm in $vms) {
             Write-Host ("  Processing {0}..." -f $vm.Name) -ForegroundColor Green
 
-            try {
-                $vmWithStatus = Get-AzVM `
-                    -ResourceGroupName $vm.ResourceGroupName `
-                    -Name $vm.Name `
-                    -Status `
-                    -ErrorAction Stop
+            $resourceId = $vm.Id
+            $resourceIdKey = $resourceId.ToLowerInvariant()
 
-                $powerState = Get-VmPowerState -Vm $vmWithStatus
+            $cpuAvg = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "Percentage CPU" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Average" `
+                -Rollup "Average"
 
-                if (-not $IncludeStoppedVMs -and $powerState -ne "VM running" -and $powerState -ne "Unknown") {
-                    Write-Host ("  Skipping {0} ({1})" -f $vm.Name, $powerState) -ForegroundColor DarkGray
+            $cpuMax = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "Percentage CPU" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Maximum" `
+                -Rollup "Maximum"
 
-                    $results.Add([PSCustomObject]@{
-                        Month             = $window.Label
-                        SubscriptionName  = $sub.Name
-                        SubscriptionId    = $sub.Id
-                        ResourceGroupName = $vm.ResourceGroupName
-                        VMName            = $vm.Name
-                        Location          = $vm.Location
-                        VMSize            = $vm.HardwareProfile.VmSize
-                        PowerState        = $powerState
-                        AverageCpuPct     = $null
-                        PeakCpuPct        = $null
-                        SampleCount       = 0
-                        Status            = "Skipped"
-                        Error             = "VM not running"
-                    })
+            $memAvg = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "Available Memory Percentage" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Average" `
+                -Rollup "Average"
 
-                    continue
-                }
+            $memMin = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "Available Memory Percentage" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Minimum" `
+                -Rollup "Minimum"
 
-                $stats = Get-OverallCpuStats `
-                    -ResourceId $vm.Id `
-                    -StartTimeUtc $window.StartUtc `
-                    -EndTimeUtc $window.EndUtc
+            $osDiskIopsAvg = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "OS Disk IOPS Consumed Percentage" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Average" `
+                -Rollup "Average"
 
-                $results.Add([PSCustomObject]@{
-                    Month             = $window.Label
-                    SubscriptionName  = $sub.Name
-                    SubscriptionId    = $sub.Id
-                    ResourceGroupName = $vm.ResourceGroupName
-                    VMName            = $vm.Name
-                    Location          = $vm.Location
-                    VMSize            = $vm.HardwareProfile.VmSize
-                    PowerState        = $powerState
-                    AverageCpuPct     = $stats.AverageCpu
-                    PeakCpuPct        = $stats.PeakCpu
-                    SampleCount       = $stats.Samples
-                    Status            = "OK"
-                    Error             = $null
-                })
+            $networkInSum = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "Network In Total" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Total" `
+                -Rollup "Sum"
+
+            $networkOutSum = Get-MetricAggregateValue `
+                -ResourceId $resourceId `
+                -MetricName "Network Out Total" `
+                -StartTimeUtc $window.StartUtc `
+                -EndTimeUtc $window.EndUtc `
+                -AggregationType "Total" `
+                -Rollup "Sum"
+
+            $updateStatus = if ($updateStatusMap.ContainsKey($resourceIdKey)) {
+                $updateStatusMap[$resourceIdKey]
             }
-            catch {
-                $results.Add([PSCustomObject]@{
-                    Month             = $window.Label
-                    SubscriptionName  = $sub.Name
-                    SubscriptionId    = $sub.Id
-                    ResourceGroupName = $vm.ResourceGroupName
-                    VMName            = $vm.Name
-                    Location          = $vm.Location
-                    VMSize            = $vm.HardwareProfile.VmSize
-                    PowerState        = "Unknown"
-                    AverageCpuPct     = $null
-                    PeakCpuPct        = $null
-                    SampleCount       = 0
-                    Status            = "Failed"
-                    Error             = $_.Exception.Message
-                })
-
-                Write-Warning ("Failed to process {0}: {1}" -f $vm.Name, $_.Exception.Message)
+            else {
+                "No assessment data"
             }
+
+            $results.Add([PSCustomObject]@{
+                "Server Name"                           = $vm.Name
+                "Subscription Name"                     = $sub.Name
+                "Resource Group Name"                   = $vm.ResourceGroupName
+                "Tags"                                  = Convert-TagsToString -Tags $vm.Tags
+                "Percentage CPU (Avg)"                  = $cpuAvg
+                "Percentage CPU (Max)"                  = $cpuMax
+                "Available Memory Percentage (Avg)"     = $memAvg
+                "Available Memory Percentage (Min)"     = $memMin
+                "OS Disk IOPS Consumed Percentage (Avg)"= $osDiskIopsAvg
+                "Network In Total (Sum)"                = $networkInSum
+                "Network Out Total (Sum)"               = $networkOutSum
+                "Update Status"                         = $updateStatus
+                "Resource Link"                         = Get-AzureGovResourceLink -ResourceId $resourceId
+            })
         }
     }
 
-    $finalResults = $results | Sort-Object SubscriptionName, ResourceGroupName, VMName
+    $finalResults = $results | Sort-Object "Subscription Name", "Resource Group Name", "Server Name"
 
-    $finalResults | Format-Table -AutoSize
+    $finalResults | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
     $finalResults |
-        Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
+        Select-Object "Server Name","Subscription Name","Resource Group Name","Percentage CPU (Avg)","Percentage CPU (Max)","Update Status" |
+        Format-Table -AutoSize
 
     Write-Host ""
     Write-Host ("Report exported to: {0}" -f $OutputCsv) -ForegroundColor Cyan
