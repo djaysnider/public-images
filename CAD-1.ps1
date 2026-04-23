@@ -8,7 +8,7 @@
     - Enumerates all accessible subscriptions
     - Enumerates all VMs in each subscription
     - Pulls Azure Monitor "Percentage CPU" for the previous calendar month
-    - Outputs to screen and CSV
+    - Outputs results to screen and CSV
 
 .NOTES
     Required modules:
@@ -59,6 +59,27 @@ function Get-PreviousMonthWindowUtc {
         EndUtc     = $endLocal.ToUniversalTime()
         Label      = $startLocal.ToString("yyyy-MM")
     }
+}
+
+function Get-VmPowerState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Vm
+    )
+
+    $statusesProperty = $Vm.PSObject.Properties["Statuses"]
+
+    if ($statusesProperty -and $statusesProperty.Value) {
+        $power = $statusesProperty.Value |
+            Where-Object { $_.Code -like "PowerState/*" } |
+            Select-Object -ExpandProperty DisplayStatus -First 1
+
+        if ($power) {
+            return $power
+        }
+    }
+
+    return "Unknown"
 }
 
 function Get-OverallCpuStats {
@@ -157,7 +178,7 @@ try {
 
         Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
-        $vms = Get-AzVM -Status
+        $vms = Get-AzVM
 
         if (-not $vms) {
             Write-Host "  No VMs found." -ForegroundColor DarkGray
@@ -165,33 +186,39 @@ try {
         }
 
         foreach ($vm in $vms) {
-            $powerState = ($vm.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -ExpandProperty DisplayStatus -First 1)
-
-            if (-not $IncludeStoppedVMs -and $powerState -ne "VM running") {
-                Write-Host ("  Skipping {0} ({1})" -f $vm.Name, $powerState) -ForegroundColor DarkGray
-
-                $results.Add([PSCustomObject]@{
-                    Month             = $window.Label
-                    SubscriptionName  = $sub.Name
-                    SubscriptionId    = $sub.Id
-                    ResourceGroupName = $vm.ResourceGroupName
-                    VMName            = $vm.Name
-                    Location          = $vm.Location
-                    VMSize            = $vm.HardwareProfile.VmSize
-                    PowerState        = $powerState
-                    AverageCpuPct     = $null
-                    PeakCpuPct        = $null
-                    SampleCount       = 0
-                    Status            = "Skipped"
-                    Error             = "VM not running"
-                })
-
-                continue
-            }
-
             Write-Host ("  Processing {0}..." -f $vm.Name) -ForegroundColor Green
 
             try {
+                $vmWithStatus = Get-AzVM `
+                    -ResourceGroupName $vm.ResourceGroupName `
+                    -Name $vm.Name `
+                    -Status `
+                    -ErrorAction Stop
+
+                $powerState = Get-VmPowerState -Vm $vmWithStatus
+
+                if (-not $IncludeStoppedVMs -and $powerState -ne "VM running" -and $powerState -ne "Unknown") {
+                    Write-Host ("  Skipping {0} ({1})" -f $vm.Name, $powerState) -ForegroundColor DarkGray
+
+                    $results.Add([PSCustomObject]@{
+                        Month             = $window.Label
+                        SubscriptionName  = $sub.Name
+                        SubscriptionId    = $sub.Id
+                        ResourceGroupName = $vm.ResourceGroupName
+                        VMName            = $vm.Name
+                        Location          = $vm.Location
+                        VMSize            = $vm.HardwareProfile.VmSize
+                        PowerState        = $powerState
+                        AverageCpuPct     = $null
+                        PeakCpuPct        = $null
+                        SampleCount       = 0
+                        Status            = "Skipped"
+                        Error             = "VM not running"
+                    })
+
+                    continue
+                }
+
                 $stats = Get-OverallCpuStats `
                     -ResourceId $vm.Id `
                     -StartTimeUtc $window.StartUtc `
@@ -222,7 +249,7 @@ try {
                     VMName            = $vm.Name
                     Location          = $vm.Location
                     VMSize            = $vm.HardwareProfile.VmSize
-                    PowerState        = $powerState
+                    PowerState        = "Unknown"
                     AverageCpuPct     = $null
                     PeakCpuPct        = $null
                     SampleCount       = 0
@@ -243,7 +270,7 @@ try {
         Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
     Write-Host ""
-    Write-Host ("Report exported to: {0}" -f (Resolve-Path -LiteralPath $OutputCsv)) -ForegroundColor Cyan
+    Write-Host ("Report exported to: {0}" -f $OutputCsv) -ForegroundColor Cyan
 }
 catch {
     Write-Error $_.Exception.Message
